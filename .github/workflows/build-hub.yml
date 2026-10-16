@@ -1,0 +1,150 @@
+# Build used by the zJu4nn Hub "Mashups" tab (fork zJu4nn-Hub/er-mario).
+# - The mod DLL (Rust + the patched libsm64 in libsm64/, compiled into the DLL by build.rs) is compiled HERE from
+#   this fork's source, at the upstream v0.4.2 commit, the same way the author's own CI does
+#   (.github/workflows/collision.yml: windows-latest, clang-cl from the preinstalled LLVM, MSVC dev env).
+# - NO ROM is used or needed to build. libsm64/import-mario-geo.py downloads two files of Mario's model CODE from the
+#   n64decomp/sm64 repository (pinned commit, checked by sha256 here) and strips his vertices, light colours and
+#   textures out of them: those are read from the PLAYER'S own ROM on their PC at the first launch.
+# - er-mario.me3 (me3 profile), er_mario.ini, README.txt and licenses/ are NOT in the repository (the author builds
+#   the release zip from his own folder): they are taken from the upstream v0.4.2 release zip, pinned by sha256
+#   (zip and each file). The upstream er_mario.dll is NOT used.
+# - er_mario.ini: update_check is switched off (the Hub shows updates itself; the in-game note points to GitHub).
+#   Set UPDATE_CHECK to "on" to keep the author's default.
+# Upstream: https://github.com/deltarooo/er-mario (MIT); libsm64 (CC0); hudhook (MIT); MinHook (BSD-2-Clause).
+name: build-hub
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. hub-v0.4.2-1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      SRC: 11744b855bf546ca0b66dfd09068858feaa18d0e        # upstream tag v0.4.2 ("Release 0.4.2")
+      UP_URL: https://github.com/deltarooo/er-mario/releases/download/v0.4.2/ER-Mario-0.4.2.zip
+      UP_SHA256: ed52be7d9475533d61b42c28c26fbf7c7a8c106a78fd8d162f881bb83cede7bf
+      ME3_SHA256: 6db41bb19f70fb350b27a073ff360a6950ed759618d4e6f8ca060138c5c94a7f   # ER-Mario/er-mario.me3
+      INI_SHA256: 0f146a60260055667f16dfb22f0dd311d887f3e6d1b3f985ad8fd74bca8f546b   # ER-Mario/er_mario.ini (before the patch)
+      # n64decomp/sm64 @ 06ec56df7f951f88da05f468cdcacecba496145a (the URLs inside libsm64/import-mario-geo.py)
+      GEO_SHA256: fc276e326a9cb22f55dfae8349b0ff746b9a7db7c108074a47508f3e2b225364     # actors/mario/geo.inc.c
+      MODEL_SHA256: 3c28959f915121cd94daab7941e144078098b3cac668fdc70817f4127c549e8f   # actors/mario/model.inc.c
+      UPDATE_CHECK: "off"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SRC }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Mario's model code (public decomp source, no ROM)
+        shell: pwsh
+        run: |
+          $base = 'https://raw.githubusercontent.com/n64decomp/sm64/06ec56df7f951f88da05f468cdcacecba496145a/actors/mario'
+          Invoke-WebRequest "$base/geo.inc.c" -OutFile geo.check
+          Invoke-WebRequest "$base/model.inc.c" -OutFile model.check
+          $g = (Get-FileHash geo.check -Algorithm SHA256).Hash.ToLower()
+          $m = (Get-FileHash model.check -Algorithm SHA256).Hash.ToLower()
+          if ($g -ne $env:GEO_SHA256) { throw "geo.inc.c sha256 mismatch: $g" }
+          if ($m -ne $env:MODEL_SHA256) { throw "model.inc.c sha256 mismatch: $m" }
+          Remove-Item geo.check, model.check
+          Push-Location libsm64
+          python import-mario-geo.py
+          if ($LASTEXITCODE -ne 0) { throw "import-mario-geo.py failed" }
+          Pop-Location
+          # the stripped model must carry no vertex/light data (the script itself refuses otherwise; checked again)
+          if (Select-String -Path libsm64/src/decomp/mario/model.inc.c -Pattern 'static const Vtx|static const Lights1' -Quiet) { throw "model data left in model.inc.c" }
+
+      - name: Mod DLL
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\Program Files\LLVM\bin;$env:PATH"
+          $env:CC_x86_64_pc_windows_msvc = 'clang-cl'
+          # no runner paths in the DLL's panic messages (same idea as build.ps1)
+          $reg = Get-ChildItem "$env:USERPROFILE\.cargo\registry\src" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
+          $flags = @("--remap-path-prefix=$((Get-Location).Path)=src", "--remap-path-prefix=$env:USERPROFILE=~")
+          if ($reg) { $flags = @("--remap-path-prefix=$($reg.FullName)=crates") + $flags }
+          $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = $flags -join ' '
+          cargo build --locked --release
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+          $dll = 'target/x86_64-pc-windows-msvc/release/er_mario.dll'
+          if (!(Test-Path $dll)) { throw "er_mario.dll not found" }
+          "er_mario.dll: $((Get-Item $dll).Length) bytes"
+
+      - name: Upstream profile, settings and licenses (pinned)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest $env:UP_URL -OutFile up.zip
+          $h = (Get-FileHash up.zip -Algorithm SHA256).Hash.ToLower()
+          if ($h -ne $env:UP_SHA256) { throw "upstream zip sha256 mismatch: $h" }
+          Expand-Archive up.zip up
+          $me3 = (Get-FileHash up/ER-Mario/er-mario.me3 -Algorithm SHA256).Hash.ToLower()
+          if ($me3 -ne $env:ME3_SHA256) { throw "er-mario.me3 sha256 mismatch: $me3" }
+          $ini = (Get-FileHash up/ER-Mario/er_mario.ini -Algorithm SHA256).Hash.ToLower()
+          if ($ini -ne $env:INI_SHA256) { throw "er_mario.ini sha256 mismatch: $ini" }
+          "upstream er_mario.dll: $((Get-Item up/ER-Mario/er_mario.dll).Length) bytes (not used)"
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ver = ((Get-Content Cargo.toml | Where-Object { $_ -match '^version' } | Select-Object -First 1) -split '"')[1]
+          if ($ver -ne '0.4.2') { throw "unexpected version $ver" }
+          $p = 'pkg'
+          New-Item -ItemType Directory "$p/licenses" -Force | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/er_mario.dll "$p/er_mario.dll"
+          Copy-Item up/ER-Mario/er-mario.me3 "$p/er-mario.me3"
+          Copy-Item up/ER-Mario/README.txt "$p/README.txt"
+          # settings: same file, update_check per UPDATE_CHECK (exactly one line must change). LF kept as upstream.
+          $ini = [IO.File]::ReadAllText((Resolve-Path up/ER-Mario/er_mario.ini).Path)
+          $novo = [regex]::Replace($ini, '(?m)^update_check = on$', "update_check = $env:UPDATE_CHECK")
+          if ($env:UPDATE_CHECK -ne 'on' -and $novo -eq $ini) { throw "update_check line not found in er_mario.ini" }
+          if (([regex]::Matches($ini, '(?m)^update_check = ')).Count -ne 1) { throw "update_check must appear once" }
+          [IO.File]::WriteAllText((Join-Path (Get-Location) "$p/er_mario.ini"), $novo, (New-Object Text.UTF8Encoding $false))
+          # the ROM line must stay empty: the Hub copies the player's ROM next to the DLL and the mod finds it there
+          if (!(Select-String -Path "$p/er_mario.ini" -Pattern '^rom =\s*$' -Quiet)) { throw "rom = must stay empty" }
+          Copy-Item up/ER-Mario/licenses/* "$p/licenses/"
+          Copy-Item LICENSE "$p/licenses/er-mario-MIT.txt"
+          Copy-Item vendor/hudhook/LICENSE "$p/licenses/hudhook-MIT.txt"
+          Copy-Item vendor/hudhook/vendor/minhook/LICENSE.txt "$p/licenses/MinHook-BSD-2-Clause.txt"
+          @(
+            "ER Mario $ver (build do zJu4nn Hub)",
+            '',
+            'Elden Ring jogado como o Mario, com o movimento de verdade do Super Mario 64. Original de deltarooo',
+            '(github.com/deltarooo/er-mario), licenca MIT. libsm64 (CC0) roda o Mario.',
+            'Nenhum arquivo da Nintendo vem aqui: o modelo, as texturas e os sons do Mario saem da SUA ROM do',
+            'Super Mario 64 (EUA), que o Hub coloca nesta pasta. Na 1a vez o mod monta os arquivos dele (pasta',
+            'package) a partir da sua ROM e pede pra abrir o jogo de novo.',
+            'Projeto de fas, sem ligacao com Nintendo, FromSoftware ou Bandai Namco.'
+          ) | Set-Content "$p/LEIA.txt" -Encoding utf8
+          $sums = Get-ChildItem $p -Recurse -File | ForEach-Object {
+            $rel = $_.FullName.Substring((Resolve-Path $p).Path.Length + 1).Replace('\','/')
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $rel"
+          }
+          $sums | Set-Content "$p/SHA256SUMS.txt" -Encoding ascii
+          $sums
+          $zip = "er-mario-hub-$ver.zip"
+          Compress-Archive -Path "$p/*" -DestinationPath $zip
+          "ZIP=$zip" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "VER=$ver" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Get-FileHash $zip -Algorithm SHA256 | Format-List
+          "size: $((Get-Item $zip).Length)"
+
+      - name: Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.tag }}" $env:ZIP --repo "${{ github.repository }}" --target $env:SRC --title "ER Mario $env:VER (zJu4nn Hub)" --notes "Build of deltarooo/er-mario $env:VER for the zJu4nn Hub Mashups tab. Mod DLL compiled from this fork at $env:SRC (no ROM involved); er-mario.me3, README.txt and licenses from the upstream v0.4.2 zip (sha256 $env:UP_SHA256); er_mario.ini with update_check = $env:UPDATE_CHECK. No Nintendo or FromSoftware files included: the player's own Super Mario 64 (US) ROM is required. MIT (libsm64: CC0)."
